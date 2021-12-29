@@ -4,22 +4,32 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
 type MediaFile struct {
+	durration float64
+	mediaUrl  string
+	data      []byte
+}
+
+type Playlist struct {
 	bandwidth   uint64
 	codecs      string
 	resolutionX uint64
 	resolutionY uint64
 	name        string
-	url         string
+	baseUrl     string
+	playlistUrl string
+	streamType  string
+	segments    []MediaFile
 }
 
-type HLSPlaylist struct {
-	files []MediaFile
+type HLSMasterPlaylist struct {
+	varients []Playlist
 }
 
 func splitDirective(dir string, delimeter rune) (parts []string) {
@@ -52,18 +62,74 @@ func splitDirective(dir string, delimeter rune) (parts []string) {
 	return
 }
 
-func HLSPlaylistParse(text string) (out HLSPlaylist) {
+func (m *MediaFile) ResolveData() {
+	resp, err := http.Get(m.mediaUrl)
+	if err != nil {
+		panic(err)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil && resp.StatusCode > 299 {
+		panic(err)
+	}
+	m.data = body
+}
+
+func (pl *Playlist) HLSPlaylistParse() {
+	extInfMatch, _ := regexp.Compile("EXTINF:*")
+	streamTypeMatch, _ := regexp.Compile("EXT-X-PLAYLIST-TYPE:*")
+
+	resp, err := http.Get(pl.playlistUrl)
+	if err != nil {
+		panic(err)
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil && resp.StatusCode > 299 {
+		panic(err)
+	}
+
+	text := string(body)
+	directives := strings.Split(text, "#")
+	for i := 0; i < len(directives); i++ {
+		if streamTypeMatch.MatchString(directives[i]) {
+			chunks := strings.Split(directives[i], ":")
+			pl.streamType = strings.TrimSuffix(chunks[len(chunks)-1], "\n")
+		}
+		if extInfMatch.MatchString(directives[i]) {
+			var media MediaFile
+
+			parts := strings.Split(directives[i], "\n")
+
+			chunks := splitDirective(parts[0], ',')
+			durr := strings.TrimPrefix(chunks[0], "EXTINF:")
+			media.durration, _ = strconv.ParseFloat(durr, 64)
+
+			media.mediaUrl = pl.baseUrl + parts[1]
+
+			pl.segments = append(pl.segments, media)
+		}
+	}
+
+}
+
+func HLSMasterPlaylistParse(text string, url string) (out HLSMasterPlaylist) {
 	streamInfMatch, _ := regexp.Compile("EXT-X-STREAM-INF:*")
 	bandwidthMatch, _ := regexp.Compile("BANDWIDTH=([0-9]+)")
 	codecMatch, _ := regexp.Compile("CODECS=")
 	nameMatch, _ := regexp.Compile("NAME=")
 	resMatch, _ := regexp.Compile("RESOLUTION=")
 
+	dir, _ := filepath.Split(url)
+
 	directives := strings.Split(text, "#")
 
 	for i := 0; i < len(directives); i++ {
 		if streamInfMatch.MatchString(directives[i]) {
-			var media MediaFile
+			var media Playlist
+			media.baseUrl = dir
 
 			parts := strings.Split(directives[i], "\n")
 
@@ -89,9 +155,9 @@ func HLSPlaylistParse(text string) (out HLSPlaylist) {
 				}
 			}
 
-			media.url = parts[1]
+			media.playlistUrl = dir + parts[1]
 
-			out.files = append(out.files, media)
+			out.varients = append(out.varients, media)
 		}
 	}
 
@@ -99,7 +165,9 @@ func HLSPlaylistParse(text string) (out HLSPlaylist) {
 }
 
 func main() {
-	resp, err := http.Get("https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8")
+	url := "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+
+	resp, err := http.Get(url)
 	if err != nil {
 		panic(err)
 	}
@@ -110,12 +178,18 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println(string(body))
-
-	playlist := HLSPlaylistParse(string(body))
+	playlist := HLSMasterPlaylistParse(string(body), url)
 	fmt.Println("{")
-	for i := 0; i < len(playlist.files); i++ {
-		fmt.Println("\t", playlist.files[i])
+	for i := 0; i < len(playlist.varients); i++ {
+		playlist.varients[i].HLSPlaylistParse()
+		fmt.Println("\t", playlist.varients[i])
 	}
 	fmt.Println("}")
+
+	// Resolve first varient
+	for i := 0; i < len(playlist.varients[0].segments); i++ {
+		playlist.varients[0].segments[i].ResolveData()
+		// fmt.Println(playlist.varients[0].segments[i].data)
+	}
+
 }
